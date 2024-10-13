@@ -8,29 +8,110 @@ module "vpc" {
   name    = "eks-vpc"
   cidr    = "10.0.0.0/16"
   azs     = ["us-west-2a", "us-west-2b", "us-west-2c"]
+
+  # Defining private and public subnets
   private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
   public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+
+  # Enable NAT gateway for private subnet internet access
   enable_nat_gateway = true
+
+  # Attach an Internet Gateway to enable public subnet internet access
+  enable_vpn_gateway = true
 }
 
-# IAM Role for EKS
-module "eks_role" {
-  source = "terraform-aws-modules/iam/aws//modules/iam-role"
-  name   = "eks-cluster-role"
-  attach_eks_policy = true
+# IAM Role for EKS Cluster
+resource "aws_iam_role" "eks_cluster_role" {
+  name = "eks-cluster-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "eks.amazonaws.com"
+      }
+    }]
+  })
 }
 
-# EKS Cluster
+# Attach EKS Cluster Policies to the Role
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.eks_cluster_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_service_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSServicePolicy"
+  role       = aws_iam_role.eks_cluster_role.name
+}
+
+# IAM Role for EKS Worker Nodes (Node Groups)
+resource "aws_iam_role" "eks_worker_role" {
+  name = "eks-worker-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+}
+
+# Attach Policies for Worker Nodes
+resource "aws_iam_role_policy_attachment" "eks_worker_node_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.eks_worker_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cni_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSCNIPolicy"
+  role       = aws_iam_role.eks_worker_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_ecr_read_only" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.eks_worker_role.name
+}
+
+# Security Group for EKS Cluster and EC2 Access
+resource "aws_security_group" "eks_security_group" {
+  vpc_id = module.vpc.vpc_id
+  name   = "eks-cluster-sg"
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# EKS Cluster Definition (Public and Private Access)
 module "eks_cluster" {
   source          = "terraform-aws-modules/eks/aws"
   cluster_name    = "my-eks-cluster"
   cluster_version = "1.25"
-  subnets         = module.vpc.private_subnets
+  subnets         = concat(module.vpc.private_subnets, module.vpc.public_subnets)
   vpc_id          = module.vpc.vpc_id
-  cluster_endpoint_private_access = true
-  cluster_endpoint_public_access  = false
 
-  manage_aws_auth = true
+  # Allow both private and public access to the EKS API
+  cluster_endpoint_private_access = true
+  cluster_endpoint_public_access  = true
+
+  cluster_iam_role_name = aws_iam_role.eks_cluster_role.name
 
   node_groups = {
     on_demand = {
@@ -39,8 +120,11 @@ module "eks_cluster" {
       min_capacity     = 1
 
       instance_type = "m5.large"
+      key_name      = "my-key"
+      iam_role_arn  = aws_iam_role.eks_worker_role.arn
 
-      key_name = "my-key"
+      # Public subnet for on-demand nodes
+      subnet_ids = module.vpc.public_subnets
 
       additional_tags = {
         "node-type" = "on-demand"
@@ -54,8 +138,11 @@ module "eks_cluster" {
 
       instance_type = "m5.large"
       spot_price    = "0.05"
+      key_name      = "my-key"
+      iam_role_arn  = aws_iam_role.eks_worker_role.arn
 
-      key_name = "my-key"
+      # Private subnet for spot instances
+      subnet_ids = module.vpc.private_subnets
 
       additional_tags = {
         "node-type" = "spot"
@@ -64,7 +151,7 @@ module "eks_cluster" {
   }
 }
 
-# EC2 instance for application licensing
+# EC2 instance for application licensing (in public subnet)
 resource "aws_instance" "app_licensing" {
   ami                         = "ami-0abcdef1234567890" # Use a proper AMI ID for your region
   instance_type               = "t3.micro"
@@ -72,7 +159,60 @@ resource "aws_instance" "app_licensing" {
   associate_public_ip_address = true
   key_name                    = "my-key"
 
+  # Security group allowing inbound access to EC2 instance
+  vpc_security_group_ids      = [aws_security_group.eks_security_group.id]
+
   tags = {
     Name = "App-Licensing-Server"
   }
+}
+
+# Create an Internet Gateway for the VPC (public internet access for EC2)
+resource "aws_internet_gateway" "igw" {
+  vpc_id = module.vpc.vpc_id
+}
+
+# Route table for public subnets to access the internet
+resource "aws_route_table" "public_route_table" {
+  vpc_id = module.vpc.vpc_id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+}
+
+# Associate route table with public subnets
+resource "aws_route_table_association" "public_subnet_association" {
+  for_each = toset(module.vpc.public_subnets)
+  subnet_id = each.value
+  route_table_id = aws_route_table.public_route_table.id
+}
+
+# NAT Gateway for private subnets to access the internet (via NAT)
+resource "aws_nat_gateway" "nat_gw" {
+  allocation_id = aws_eip.nat_eip.id
+  subnet_id     = module.vpc.public_subnets[0] # NAT Gateway in public subnet
+}
+
+# Elastic IP for the NAT Gateway
+resource "aws_eip" "nat_eip" {
+  vpc = true
+}
+
+# Route table for private subnets (via NAT Gateway)
+resource "aws_route_table" "private_route_table" {
+  vpc_id = module.vpc.vpc_id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat_gw.id
+  }
+}
+
+# Associate route table with private subnets
+resource "aws_route_table_association" "private_subnet_association" {
+  for_each = toset(module.vpc.private_subnets)
+  subnet_id = each.value
+  route_table_id = aws_route_table.private_route_table.id
 }
